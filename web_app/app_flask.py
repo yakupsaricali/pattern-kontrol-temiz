@@ -1,17 +1,27 @@
-from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_file
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import secrets
 import os
-import subprocess
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Session için secret key
 
-# Dosya yolları
+# Dosya yolları - Render Disk veya local
 BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
+# Render Disk kontrolü (Render'da disk mount path'i genellikle /opt/render/project/src/disk)
+RENDER_DISK_PATH = Path('/opt/render/project/src/disk')
+if RENDER_DISK_PATH.exists():
+    # Render Disk kullan
+    DATA_DIR = RENDER_DISK_PATH / "data"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"✅ Render Disk kullanılıyor: {DATA_DIR}")
+else:
+    # Local kullan
+    DATA_DIR = BASE_DIR / "data"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"✅ Local disk kullanılıyor: {DATA_DIR}")
 
 PATTERNS_FILE = DATA_DIR / "test_ai_pattern_results.csv"
 APPROVED_FILE = DATA_DIR / "approved_patterns.csv"
@@ -21,8 +31,6 @@ REJECTED_FILE = DATA_DIR / "rejected_patterns.csv"
 patterns_data = None
 reviewed_skus = set()
 current_index = 0
-commit_counter = 0  # GitHub commit için sayaç
-COMMIT_INTERVAL = 10  # Her 10 kayıtta bir commit
 
 def load_patterns():
     global patterns_data
@@ -94,39 +102,7 @@ def get_current_pattern():
         'remaining': len(df)
     }
 
-def commit_to_github():
-    """CSV dosyalarını GitHub'a commit et"""
-    try:
-        # Git repo kontrolü
-        git_dir = BASE_DIR / ".git"
-        if not git_dir.exists():
-            return False  # Git repo yok, commit yapma
-        
-        # Git komutları
-        os.chdir(BASE_DIR)
-        
-        # CSV dosyalarını stage'e ekle
-        subprocess.run(['git', 'add', 'data/approved_patterns.csv'], 
-                      capture_output=True, check=False)
-        subprocess.run(['git', 'add', 'data/rejected_patterns.csv'], 
-                      capture_output=True, check=False)
-        
-        # Commit yap
-        commit_message = f"Auto-commit: Pattern reviews - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        result = subprocess.run(['git', 'commit', '-m', commit_message], 
-                              capture_output=True, check=False)
-        
-        # Push yap (eğer commit başarılıysa)
-        if result.returncode == 0:
-            subprocess.run(['git', 'push'], capture_output=True, check=False)
-            return True
-        return False
-    except Exception as e:
-        print(f"GitHub commit hatası: {e}")
-        return False
-
 def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
-    global commit_counter
     timestamp = datetime.now().isoformat()
     user_email = session.get('email', 'unknown')
     data = {
@@ -145,12 +121,6 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
     else:
         df.to_csv(filename, index=False, encoding='utf-8-sig')
     reviewed_skus.add(str(variant_sku))
-    
-    # Her COMMIT_INTERVAL kayıtta bir GitHub'a commit et
-    commit_counter += 1
-    if commit_counter >= COMMIT_INTERVAL:
-        commit_to_github()
-        commit_counter = 0
 
 # İlk yükleme
 load_patterns()
@@ -691,6 +661,7 @@ def results():
                 <h1>📊 Sonuçlarım</h1>
                 <div>
                     <a href="/" class="btn">← Ana Sayfa</a>
+                    <a href="/admin/all" class="btn" style="background: #4CAF50; margin-left: 0.5rem;">📊 Tüm Kayıtlar</a>
                     <a href="/logout" class="btn" style="background: #f44336; margin-left: 0.5rem;">Çıkış</a>
                 </div>
             </div>
@@ -824,6 +795,306 @@ def api_next():
     global current_index
     current_index += 1
     return jsonify({'success': True})
+
+@app.route('/admin/all')
+def admin_all():
+    """Tüm kayıtları görüntüleme sayfası (tüm kullanıcılar)"""
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    
+    # Tüm onaylanan ve reddedilen kayıtları oku
+    approved_data = []
+    rejected_data = []
+    
+    if APPROVED_FILE.exists():
+        try:
+            df_approved = pd.read_csv(APPROVED_FILE, encoding='utf-8-sig', on_bad_lines='skip')
+            approved_data = df_approved.to_dict('records')
+        except Exception as e:
+            print(f"Approved CSV okuma hatası: {e}")
+    
+    if REJECTED_FILE.exists():
+        try:
+            df_rejected = pd.read_csv(REJECTED_FILE, encoding='utf-8-sig', on_bad_lines='skip')
+            rejected_data = df_rejected.to_dict('records')
+        except Exception as e:
+            print(f"Rejected CSV okuma hatası: {e}")
+    
+    # Kullanıcı bazlı istatistikler
+    user_stats = {}
+    for item in approved_data + rejected_data:
+        email = item.get('Reviewed By', 'unknown')
+        if email not in user_stats:
+            user_stats[email] = {'approved': 0, 'rejected': 0}
+        if item.get('Status') == 'Approved':
+            user_stats[email]['approved'] += 1
+        else:
+            user_stats[email]['rejected'] += 1
+    
+    admin_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>📊 Tüm Kayıtlar - Admin</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                margin: 0;
+                padding: 1rem;
+            }}
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 20px;
+                padding: 2rem;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }}
+            .header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 2rem;
+                flex-wrap: wrap;
+                gap: 1rem;
+            }}
+            h1 {{ color: #333; margin: 0; }}
+            .btn {{
+                padding: 0.8rem 1.5rem;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: bold;
+                cursor: pointer;
+                display: inline-block;
+            }}
+            .btn-danger {{
+                background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);
+            }}
+            .stats {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 1rem;
+                margin-bottom: 2rem;
+            }}
+            .stat-card {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 1.5rem;
+                border-radius: 15px;
+                text-align: center;
+            }}
+            .stat-card h3 {{
+                font-size: 2.5rem;
+                margin: 0;
+            }}
+            .stat-card p {{
+                margin: 0.5rem 0 0 0;
+                font-size: 1.1rem;
+            }}
+            .user-stats {{
+                background: #f5f5f5;
+                padding: 1.5rem;
+                border-radius: 15px;
+                margin-bottom: 2rem;
+            }}
+            .user-stats h2 {{
+                margin-top: 0;
+                color: #333;
+            }}
+            .user-item {{
+                display: flex;
+                justify-content: space-between;
+                padding: 0.8rem;
+                margin: 0.5rem 0;
+                background: white;
+                border-radius: 10px;
+                border-left: 4px solid #667eea;
+            }}
+            .section {{
+                margin-bottom: 3rem;
+            }}
+            .section h2 {{
+                color: #333;
+                margin-bottom: 1rem;
+                padding-bottom: 0.5rem;
+                border-bottom: 2px solid #667eea;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 1rem;
+            }}
+            th, td {{
+                padding: 1rem;
+                text-align: left;
+                border-bottom: 1px solid #e0e0e0;
+            }}
+            th {{
+                background: #f5f5f5;
+                font-weight: bold;
+                color: #333;
+            }}
+            tr:hover {{
+                background: #f9f9f9;
+            }}
+            .download-btn {{
+                background: #4CAF50;
+                margin-left: 0.5rem;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📊 Tüm Kayıtlar (Admin)</h1>
+                <div>
+                    <a href="/" class="btn">← Ana Sayfa</a>
+                    <a href="/results" class="btn">📊 Sonuçlarım</a>
+                    <a href="/logout" class="btn btn-danger">Çıkış</a>
+                </div>
+            </div>
+            
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>{len(approved_data)}</h3>
+                    <p>✅ Toplam Onaylanan</p>
+                </div>
+                <div class="stat-card" style="background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);">
+                    <h3>{len(rejected_data)}</h3>
+                    <p>❌ Toplam Reddedilen</p>
+                </div>
+                <div class="stat-card" style="background: linear-gradient(135deg, #2196F3 0%, #1976D2 100%);">
+                    <h3>{len(approved_data) + len(rejected_data)}</h3>
+                    <p>📝 Toplam Kayıt</p>
+                </div>
+                <div class="stat-card" style="background: linear-gradient(135deg, #4CAF50 0%, #388E3C 100%);">
+                    <h3>{len(user_stats)}</h3>
+                    <p>👥 Kullanıcı Sayısı</p>
+                </div>
+            </div>
+            
+            <div class="user-stats">
+                <h2>👥 Kullanıcı İstatistikleri</h2>
+    """
+    
+    for email, stats in sorted(user_stats.items(), key=lambda x: x[1]['approved'] + x[1]['rejected'], reverse=True):
+        admin_html += f"""
+                <div class="user-item">
+                    <div>
+                        <strong>{email}</strong>
+                        <div style="font-size: 0.9rem; color: #666; margin-top: 0.3rem;">
+                            ✅ {stats['approved']} Onay | ❌ {stats['rejected']} Red | 📝 {stats['approved'] + stats['rejected']} Toplam
+                        </div>
+                    </div>
+                </div>
+        """
+    
+    admin_html += """
+            </div>
+            
+            <div class="section">
+                <h2>✅ Tüm Onaylanan Pattern'ler (""" + str(len(approved_data)) + """) 
+                    <a href="/download/approved" class="btn download-btn">📥 CSV İndir</a>
+                </h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Variant SKU</th>
+                            <th>Product SKU</th>
+                            <th>AI Pattern</th>
+                            <th>Reviewed By</th>
+                            <th>Tarih</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+    
+    for item in approved_data:
+        admin_html += f"""
+                        <tr>
+                            <td>{item.get('Variant SKU', '')}</td>
+                            <td>{item.get('Product SKU', '')}</td>
+                            <td>{item.get('AI Detected Pattern', '')}</td>
+                            <td>{item.get('Reviewed By', '')}</td>
+                            <td>{item.get('Timestamp', '')[:19] if item.get('Timestamp') else ''}</td>
+                        </tr>
+        """
+    
+    admin_html += """
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="section">
+                <h2>❌ Tüm Reddedilen Pattern'ler (""" + str(len(rejected_data)) + """) 
+                    <a href="/download/rejected" class="btn download-btn">📥 CSV İndir</a>
+                </h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Variant SKU</th>
+                            <th>Product SKU</th>
+                            <th>AI Pattern</th>
+                            <th>Reviewed By</th>
+                            <th>Tarih</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+    
+    for item in rejected_data:
+        admin_html += f"""
+                        <tr>
+                            <td>{item.get('Variant SKU', '')}</td>
+                            <td>{item.get('Product SKU', '')}</td>
+                            <td>{item.get('AI Detected Pattern', '')}</td>
+                            <td>{item.get('Reviewed By', '')}</td>
+                            <td>{item.get('Timestamp', '')[:19] if item.get('Timestamp') else ''}</td>
+                        </tr>
+        """
+    
+    admin_html += """
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return admin_html
+
+@app.route('/download/<file_type>')
+def download_csv(file_type):
+    """CSV dosyalarını indirme endpoint'i"""
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    
+    if file_type == 'approved':
+        file_path = APPROVED_FILE
+        filename = 'approved_patterns.csv'
+    elif file_type == 'rejected':
+        file_path = REJECTED_FILE
+        filename = 'rejected_patterns.csv'
+    else:
+        return jsonify({'error': 'Invalid file type'}), 400
+    
+    if not file_path.exists():
+        return jsonify({'error': 'File not found'}), 404
+    
+    from flask import send_file
+    return send_file(
+        str(file_path),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=filename
+    )
 
 if __name__ == '__main__':
     import os
