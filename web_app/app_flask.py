@@ -3,6 +3,8 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import secrets
+import os
+import subprocess
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Session için secret key
@@ -19,6 +21,8 @@ REJECTED_FILE = DATA_DIR / "rejected_patterns.csv"
 patterns_data = None
 reviewed_skus = set()
 current_index = 0
+commit_counter = 0  # GitHub commit için sayaç
+COMMIT_INTERVAL = 10  # Her 10 kayıtta bir commit
 
 def load_patterns():
     global patterns_data
@@ -90,7 +94,39 @@ def get_current_pattern():
         'remaining': len(df)
     }
 
+def commit_to_github():
+    """CSV dosyalarını GitHub'a commit et"""
+    try:
+        # Git repo kontrolü
+        git_dir = BASE_DIR / ".git"
+        if not git_dir.exists():
+            return False  # Git repo yok, commit yapma
+        
+        # Git komutları
+        os.chdir(BASE_DIR)
+        
+        # CSV dosyalarını stage'e ekle
+        subprocess.run(['git', 'add', 'data/approved_patterns.csv'], 
+                      capture_output=True, check=False)
+        subprocess.run(['git', 'add', 'data/rejected_patterns.csv'], 
+                      capture_output=True, check=False)
+        
+        # Commit yap
+        commit_message = f"Auto-commit: Pattern reviews - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        result = subprocess.run(['git', 'commit', '-m', commit_message], 
+                              capture_output=True, check=False)
+        
+        # Push yap (eğer commit başarılıysa)
+        if result.returncode == 0:
+            subprocess.run(['git', 'push'], capture_output=True, check=False)
+            return True
+        return False
+    except Exception as e:
+        print(f"GitHub commit hatası: {e}")
+        return False
+
 def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
+    global commit_counter
     timestamp = datetime.now().isoformat()
     user_email = session.get('email', 'unknown')
     data = {
@@ -109,6 +145,12 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
     else:
         df.to_csv(filename, index=False, encoding='utf-8-sig')
     reviewed_skus.add(str(variant_sku))
+    
+    # Her COMMIT_INTERVAL kayıtta bir GitHub'a commit et
+    commit_counter += 1
+    if commit_counter >= COMMIT_INTERVAL:
+        commit_to_github()
+        commit_counter = 0
 
 # İlk yükleme
 load_patterns()
