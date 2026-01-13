@@ -358,8 +358,8 @@ HTML_TEMPLATE = """
         </div>
         
         <div class="buttons" style="margin-bottom: 1rem;">
-            <button class="btn btn-approve" onclick="approvePattern()">✅ ONAY</button>
             <button class="btn btn-reject" onclick="rejectPattern()">❌ RED</button>
+            <button class="btn btn-approve" onclick="approvePattern()">✅ ONAY</button>
         </div>
         
         <div class="image-container" id="imageContainer" style="margin-bottom: 1rem;">
