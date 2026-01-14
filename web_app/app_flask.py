@@ -4,33 +4,65 @@ from pathlib import Path
 from datetime import datetime
 import secrets
 import os
+import io
+from sqlalchemy import create_engine, Column, String, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Session için secret key
 
-# Dosya yolları - Render Disk veya local
-BASE_DIR = Path(__file__).parent.parent
-# Render Disk kontrolü (Render'da disk mount path'i genellikle /opt/render/project/src/disk)
-RENDER_DISK_PATH = Path('/opt/render/project/src/disk')
-if RENDER_DISK_PATH.exists():
-    # Render Disk kullan
-    DATA_DIR = RENDER_DISK_PATH / "data"
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"✅ Render Disk kullanılıyor: {DATA_DIR}")
-else:
-    # Local kullan
-    DATA_DIR = BASE_DIR / "data"
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"✅ Local disk kullanılıyor: {DATA_DIR}")
+# PostgreSQL bağlantısı
+DATABASE_URL = os.environ.get('DATABASE_URL')
+USE_DATABASE = False
+engine = None
+SessionLocal = None
 
+if DATABASE_URL:
+    try:
+        # Render PostgreSQL URL'i genellikle postgres:// ile başlar, SQLAlchemy postgresql:// istiyor
+        if DATABASE_URL.startswith('postgres://'):
+            DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        SessionLocal = sessionmaker(bind=engine)
+        USE_DATABASE = True
+        print("✅ PostgreSQL veritabanı kullanılıyor")
+    except Exception as e:
+        print(f"❌ PostgreSQL bağlantı hatası: {e}")
+        USE_DATABASE = False
+
+# Veritabanı modelleri
+Base = declarative_base()
+
+class PatternReview(Base):
+    __tablename__ = 'pattern_reviews'
+    
+    id = Column(String, primary_key=True)  # Variant SKU
+    variant_sku = Column(String, nullable=False)
+    product_sku = Column(String)
+    ai_pattern = Column(Text)
+    image_url = Column(Text)
+    status = Column(String, nullable=False)  # 'Approved' or 'Rejected'
+    reviewed_by = Column(String, nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+# Tabloları oluştur
+if USE_DATABASE:
+    try:
+        Base.metadata.create_all(engine)
+        print("✅ Veritabanı tabloları hazır")
+    except Exception as e:
+        print(f"❌ Tablo oluşturma hatası: {e}")
+
+# Dosya yolları - Sadece pattern yükleme için
+BASE_DIR = Path(__file__).parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 PATTERNS_FILE = DATA_DIR / "test_ai_pattern_results.csv"
-APPROVED_FILE = DATA_DIR / "approved_patterns.csv"
-REJECTED_FILE = DATA_DIR / "rejected_patterns.csv"
 
 # Global state
 patterns_data = None
-reviewed_skus = set()
-current_index = 0
+reviewed_skus = set()  # Global olarak kontrol edilen tüm SKU'lar
 
 def load_patterns():
     global patterns_data
@@ -56,41 +88,70 @@ def load_patterns():
         return None
 
 def load_reviewed_skus():
+    """Veritabanından tüm kontrol edilmiş SKU'ları yükle (global)"""
     global reviewed_skus
     reviewed = set()
-    if APPROVED_FILE.exists():
+    
+    if USE_DATABASE:
         try:
-            approved_df = pd.read_csv(APPROVED_FILE)
-            if 'Variant SKU' in approved_df.columns:
-                reviewed.update(approved_df['Variant SKU'].dropna().astype(str))
-        except:
-            pass
-    if REJECTED_FILE.exists():
-        try:
-            rejected_df = pd.read_csv(REJECTED_FILE)
-            if 'Variant SKU' in rejected_df.columns:
-                reviewed.update(rejected_df['Variant SKU'].dropna().astype(str))
-        except:
-            pass
+            db_session = SessionLocal()
+            reviews = db_session.query(PatternReview).all()
+            reviewed = {str(review.variant_sku) for review in reviews}
+            db_session.close()
+        except Exception as e:
+            print(f"Veritabanı okuma hatası: {e}")
+    else:
+        # Fallback: CSV dosyalarından oku (local development)
+        approved_file = DATA_DIR / "approved_patterns.csv"
+        rejected_file = DATA_DIR / "rejected_patterns.csv"
+        
+        if approved_file.exists():
+            try:
+                approved_df = pd.read_csv(approved_file)
+                if 'Variant SKU' in approved_df.columns:
+                    reviewed.update(approved_df['Variant SKU'].dropna().astype(str))
+            except:
+                pass
+        if rejected_file.exists():
+            try:
+                rejected_df = pd.read_csv(rejected_file)
+                if 'Variant SKU' in rejected_df.columns:
+                    reviewed.update(rejected_df['Variant SKU'].dropna().astype(str))
+            except:
+                pass
+    
     reviewed_skus = reviewed
     return reviewed
 
 def get_current_pattern():
-    global patterns_data, reviewed_skus, current_index
+    """Kullanıcı bazlı pattern döndür (her kullanıcı farklı pattern görür)"""
+    global patterns_data, reviewed_skus
+    
     if patterns_data is None:
         load_patterns()
         load_reviewed_skus()
+    
     if patterns_data is None or len(patterns_data) == 0:
         return None
-    # Filtrele: Hem reviewed olanları hem de "Error" pattern'lerini atla
+    
+    # Kullanıcı bazlı current_index (session'da saklanır)
+    user_email = session.get('email', 'unknown')
+    current_index = session.get(f'current_index_{user_email}', 0)
+    
+    # Filtrele: Hem global olarak reviewed olanları hem de "Error" pattern'lerini atla
     df = patterns_data[
         ~patterns_data['Variant SKU'].astype(str).isin(reviewed_skus) &
         (patterns_data['AI Detected Pattern'].astype(str).str.strip().str.upper() != 'ERROR')
     ].copy()
+    
     if len(df) == 0:
         return None
+    
+    # Index'i sınırla
     if current_index >= len(df):
         current_index = 0
+        session[f'current_index_{user_email}'] = 0
+    
     current_row = df.iloc[current_index]
     return {
         'variant_sku': current_row['Variant SKU'],
@@ -103,24 +164,61 @@ def get_current_pattern():
     }
 
 def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
-    timestamp = datetime.now().isoformat()
+    """Veritabanına kaydet veya CSV'ye (fallback)"""
+    timestamp = datetime.utcnow()
     user_email = session.get('email', 'unknown')
-    data = {
-        'Variant SKU': variant_sku,
-        'Product SKU': product_sku,
-        'AI Detected Pattern': ai_pattern,
-        'Design Image URL': image_url,
-        'Status': 'Approved' if approved else 'Rejected',
-        'Reviewed By': user_email,
-        'Timestamp': timestamp
-    }
-    filename = APPROVED_FILE if approved else REJECTED_FILE
-    df = pd.DataFrame([data])
-    if filename.exists():
-        df.to_csv(filename, mode='a', header=False, index=False, encoding='utf-8-sig')
+    status = 'Approved' if approved else 'Rejected'
+    
+    if USE_DATABASE:
+        try:
+            db_session = SessionLocal()
+            # Mevcut kaydı kontrol et
+            existing = db_session.query(PatternReview).filter_by(variant_sku=str(variant_sku)).first()
+            if existing:
+                # Güncelle
+                existing.product_sku = product_sku
+                existing.ai_pattern = ai_pattern
+                existing.image_url = image_url
+                existing.status = status
+                existing.reviewed_by = user_email
+                existing.timestamp = timestamp
+            else:
+                # Yeni kayıt
+                review = PatternReview(
+                    id=str(variant_sku),
+                    variant_sku=str(variant_sku),
+                    product_sku=product_sku,
+                    ai_pattern=ai_pattern,
+                    image_url=image_url,
+                    status=status,
+                    reviewed_by=user_email,
+                    timestamp=timestamp
+                )
+                db_session.add(review)
+            db_session.commit()
+            db_session.close()
+            reviewed_skus.add(str(variant_sku))
+            print(f"✅ Kayıt veritabanına kaydedildi: {variant_sku} - {status}")
+        except Exception as e:
+            print(f"❌ Veritabanı kayıt hatası: {e}")
     else:
-        df.to_csv(filename, index=False, encoding='utf-8-sig')
-    reviewed_skus.add(str(variant_sku))
+        # Fallback: CSV'ye kaydet
+        filename = DATA_DIR / ("approved_patterns.csv" if approved else "rejected_patterns.csv")
+        data = {
+            'Variant SKU': variant_sku,
+            'Product SKU': product_sku,
+            'AI Detected Pattern': ai_pattern,
+            'Design Image URL': image_url,
+            'Status': status,
+            'Reviewed By': user_email,
+            'Timestamp': timestamp.isoformat()
+        }
+        df = pd.DataFrame([data])
+        if filename.exists():
+            df.to_csv(filename, mode='a', header=False, index=False, encoding='utf-8-sig')
+        else:
+            df.to_csv(filename, index=False, encoding='utf-8-sig')
+        reviewed_skus.add(str(variant_sku))
 
 # İlk yükleme
 load_patterns()
@@ -545,27 +643,52 @@ def results():
     
     user_email = session.get('email', '')
     
-    # Onaylanan ve reddedilen sonuçları yükle
+    # Veritabanından kullanıcının kayıtlarını çek
     approved_data = []
     rejected_data = []
     
-    if APPROVED_FILE.exists():
+    if USE_DATABASE:
         try:
-            approved_df = pd.read_csv(APPROVED_FILE)
-            if 'Reviewed By' in approved_df.columns:
-                user_approved = approved_df[approved_df['Reviewed By'] == user_email]
-                approved_data = user_approved.to_dict('records')
-        except:
-            pass
-    
-    if REJECTED_FILE.exists():
-        try:
-            rejected_df = pd.read_csv(REJECTED_FILE)
-            if 'Reviewed By' in rejected_df.columns:
-                user_rejected = rejected_df[rejected_df['Reviewed By'] == user_email]
-                rejected_data = user_rejected.to_dict('records')
-        except:
-            pass
+            db_session = SessionLocal()
+            user_reviews = db_session.query(PatternReview).filter_by(reviewed_by=user_email).all()
+            db_session.close()
+            
+            for review in user_reviews:
+                item = {
+                    'Variant SKU': review.variant_sku,
+                    'Product SKU': review.product_sku,
+                    'AI Detected Pattern': review.ai_pattern,
+                    'Status': review.status,
+                    'Timestamp': review.timestamp.isoformat() if review.timestamp else ''
+                }
+                if review.status == 'Approved':
+                    approved_data.append(item)
+                else:
+                    rejected_data.append(item)
+        except Exception as e:
+            print(f"Veritabanı okuma hatası: {e}")
+    else:
+        # Fallback: CSV'den oku
+        approved_file = DATA_DIR / "approved_patterns.csv"
+        rejected_file = DATA_DIR / "rejected_patterns.csv"
+        
+        if approved_file.exists():
+            try:
+                approved_df = pd.read_csv(approved_file)
+                if 'Reviewed By' in approved_df.columns:
+                    user_approved = approved_df[approved_df['Reviewed By'] == user_email]
+                    approved_data = user_approved.to_dict('records')
+            except:
+                pass
+        
+        if rejected_file.exists():
+            try:
+                rejected_df = pd.read_csv(rejected_file)
+                if 'Reviewed By' in rejected_df.columns:
+                    user_rejected = rejected_df[rejected_df['Reviewed By'] == user_email]
+                    rejected_data = user_rejected.to_dict('records')
+            except:
+                pass
     
     results_html = f"""
     <!DOCTYPE html>
@@ -766,12 +889,14 @@ def api_approve():
     auth_error = require_auth()
     if auth_error:
         return auth_error
-    global current_index
+    user_email = session.get('email', 'unknown')
     pattern = get_current_pattern()
     if pattern:
         save_review(pattern['variant_sku'], pattern['product_sku'], 
                    pattern['ai_pattern'], pattern['image_url'], approved=True)
-        current_index += 1
+        # Kullanıcı bazlı index'i artır
+        current_index = session.get(f'current_index_{user_email}', 0)
+        session[f'current_index_{user_email}'] = current_index + 1
     return jsonify({'success': True})
 
 @app.route('/api/reject', methods=['POST'])
@@ -779,12 +904,14 @@ def api_reject():
     auth_error = require_auth()
     if auth_error:
         return auth_error
-    global current_index
+    user_email = session.get('email', 'unknown')
     pattern = get_current_pattern()
     if pattern:
         save_review(pattern['variant_sku'], pattern['product_sku'], 
                    pattern['ai_pattern'], pattern['image_url'], approved=False)
-        current_index += 1
+        # Kullanıcı bazlı index'i artır
+        current_index = session.get(f'current_index_{user_email}', 0)
+        session[f'current_index_{user_email}'] = current_index + 1
     return jsonify({'success': True})
 
 @app.route('/api/next', methods=['POST'])
@@ -792,8 +919,10 @@ def api_next():
     auth_error = require_auth()
     if auth_error:
         return auth_error
-    global current_index
-    current_index += 1
+    user_email = session.get('email', 'unknown')
+    # Kullanıcı bazlı index'i artır
+    current_index = session.get(f'current_index_{user_email}', 0)
+    session[f'current_index_{user_email}'] = current_index + 1
     return jsonify({'success': True})
 
 @app.route('/admin/all')
@@ -802,34 +931,70 @@ def admin_all():
     if 'email' not in session:
         return redirect(url_for('login'))
     
-    # Tüm onaylanan ve reddedilen kayıtları oku
+    # Veritabanından tüm kayıtları çek
     approved_data = []
     rejected_data = []
-    
-    if APPROVED_FILE.exists():
-        try:
-            df_approved = pd.read_csv(APPROVED_FILE, encoding='utf-8-sig', on_bad_lines='skip')
-            approved_data = df_approved.to_dict('records')
-        except Exception as e:
-            print(f"Approved CSV okuma hatası: {e}")
-    
-    if REJECTED_FILE.exists():
-        try:
-            df_rejected = pd.read_csv(REJECTED_FILE, encoding='utf-8-sig', on_bad_lines='skip')
-            rejected_data = df_rejected.to_dict('records')
-        except Exception as e:
-            print(f"Rejected CSV okuma hatası: {e}")
-    
-    # Kullanıcı bazlı istatistikler
     user_stats = {}
-    for item in approved_data + rejected_data:
-        email = item.get('Reviewed By', 'unknown')
-        if email not in user_stats:
-            user_stats[email] = {'approved': 0, 'rejected': 0}
-        if item.get('Status') == 'Approved':
-            user_stats[email]['approved'] += 1
-        else:
-            user_stats[email]['rejected'] += 1
+    
+    if USE_DATABASE:
+        try:
+            db_session = SessionLocal()
+            all_reviews = db_session.query(PatternReview).all()
+            db_session.close()
+            
+            for review in all_reviews:
+                item = {
+                    'Variant SKU': review.variant_sku,
+                    'Product SKU': review.product_sku,
+                    'AI Detected Pattern': review.ai_pattern,
+                    'Reviewed By': review.reviewed_by,
+                    'Status': review.status,
+                    'Timestamp': review.timestamp.isoformat() if review.timestamp else ''
+                }
+                
+                if review.status == 'Approved':
+                    approved_data.append(item)
+                else:
+                    rejected_data.append(item)
+                
+                # İstatistikler
+                email = review.reviewed_by
+                if email not in user_stats:
+                    user_stats[email] = {'approved': 0, 'rejected': 0}
+                if review.status == 'Approved':
+                    user_stats[email]['approved'] += 1
+                else:
+                    user_stats[email]['rejected'] += 1
+        except Exception as e:
+            print(f"Veritabanı okuma hatası: {e}")
+    else:
+        # Fallback: CSV'den oku
+        approved_file = DATA_DIR / "approved_patterns.csv"
+        rejected_file = DATA_DIR / "rejected_patterns.csv"
+        
+        if approved_file.exists():
+            try:
+                df_approved = pd.read_csv(approved_file, encoding='utf-8-sig', on_bad_lines='skip')
+                approved_data = df_approved.to_dict('records')
+            except Exception as e:
+                print(f"Approved CSV okuma hatası: {e}")
+        
+        if rejected_file.exists():
+            try:
+                df_rejected = pd.read_csv(rejected_file, encoding='utf-8-sig', on_bad_lines='skip')
+                rejected_data = df_rejected.to_dict('records')
+            except Exception as e:
+                print(f"Rejected CSV okuma hatası: {e}")
+        
+        # Kullanıcı bazlı istatistikler
+        for item in approved_data + rejected_data:
+            email = item.get('Reviewed By', 'unknown')
+            if email not in user_stats:
+                user_stats[email] = {'approved': 0, 'rejected': 0}
+            if item.get('Status') == 'Approved':
+                user_stats[email]['approved'] += 1
+            else:
+                user_stats[email]['rejected'] += 1
     
     admin_html = f"""
     <!DOCTYPE html>
@@ -1072,29 +1237,73 @@ def admin_all():
 
 @app.route('/download/<file_type>')
 def download_csv(file_type):
-    """CSV dosyalarını indirme endpoint'i"""
+    """CSV dosyalarını indirme endpoint'i (veritabanından)"""
     if 'email' not in session:
         return redirect(url_for('login'))
     
-    if file_type == 'approved':
-        file_path = APPROVED_FILE
-        filename = 'approved_patterns.csv'
-    elif file_type == 'rejected':
-        file_path = REJECTED_FILE
-        filename = 'rejected_patterns.csv'
-    else:
-        return jsonify({'error': 'Invalid file type'}), 400
-    
-    if not file_path.exists():
-        return jsonify({'error': 'File not found'}), 404
-    
-    from flask import send_file
-    return send_file(
-        str(file_path),
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name=filename
-    )
+    try:
+        if USE_DATABASE:
+            db_session = SessionLocal()
+            if file_type == 'approved':
+                reviews = db_session.query(PatternReview).filter_by(status='Approved').all()
+                filename = 'approved_patterns.csv'
+            elif file_type == 'rejected':
+                reviews = db_session.query(PatternReview).filter_by(status='Rejected').all()
+                filename = 'rejected_patterns.csv'
+            else:
+                return jsonify({'error': 'Invalid file type'}), 400
+            
+            db_session.close()
+            
+            # DataFrame oluştur
+            data = []
+            for review in reviews:
+                data.append({
+                    'Variant SKU': review.variant_sku,
+                    'Product SKU': review.product_sku,
+                    'AI Detected Pattern': review.ai_pattern,
+                    'Design Image URL': review.image_url,
+                    'Status': review.status,
+                    'Reviewed By': review.reviewed_by,
+                    'Timestamp': review.timestamp.isoformat() if review.timestamp else ''
+                })
+            
+            df = pd.DataFrame(data)
+            
+            # CSV'yi memory'de oluştur
+            output = io.StringIO()
+            df.to_csv(output, index=False, encoding='utf-8-sig')
+            output.seek(0)
+            
+            return send_file(
+                io.BytesIO(output.getvalue().encode('utf-8-sig')),
+                mimetype='text/csv',
+                as_attachment=True,
+                download_name=filename
+            )
+        else:
+            # Fallback: CSV dosyasından
+            if file_type == 'approved':
+                file_path = DATA_DIR / "approved_patterns.csv"
+                filename = 'approved_patterns.csv'
+            elif file_type == 'rejected':
+                file_path = DATA_DIR / "rejected_patterns.csv"
+                filename = 'rejected_patterns.csv'
+            else:
+                return jsonify({'error': 'Invalid file type'}), 400
+            
+            if not file_path.exists():
+                return jsonify({'error': 'File not found'}), 404
+            
+            return send_file(
+                str(file_path),
+                mimetype='text/csv',
+                as_attachment=True,
+                download_name=filename
+            )
+    except Exception as e:
+        print(f"CSV indirme hatası: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import os
