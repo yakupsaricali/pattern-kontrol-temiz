@@ -1,13 +1,12 @@
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_file
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import secrets
 import os
 import io
 from sqlalchemy import create_engine, Column, String, DateTime, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Session için secret key
@@ -18,18 +17,24 @@ USE_DATABASE = False
 engine = None
 SessionLocal = None
 
+print(f"🔍 DATABASE_URL kontrolü: {'VAR' if DATABASE_URL else 'YOK'}", flush=True)
 if DATABASE_URL:
     try:
         # Render PostgreSQL URL'i genellikle postgres:// ile başlar, SQLAlchemy postgresql:// istiyor
         if DATABASE_URL.startswith('postgres://'):
             DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        print(f"🔍 Database URL formatı düzeltildi", flush=True)
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
         SessionLocal = sessionmaker(bind=engine)
         USE_DATABASE = True
-        print("✅ PostgreSQL veritabanı kullanılıyor")
+        print("✅ PostgreSQL veritabanı kullanılıyor", flush=True)
     except Exception as e:
-        print(f"❌ PostgreSQL bağlantı hatası: {e}")
+        print(f"❌ PostgreSQL bağlantı hatası: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         USE_DATABASE = False
+else:
+    print("⚠️ DATABASE_URL environment variable bulunamadı!", flush=True)
 
 # Veritabanı modelleri
 Base = declarative_base()
@@ -44,7 +49,7 @@ class PatternReview(Base):
     image_url = Column(Text)
     status = Column(String, nullable=False)  # 'Approved' or 'Rejected'
     reviewed_by = Column(String, nullable=False)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    timestamp = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 # Tabloları oluştur
 if USE_DATABASE:
@@ -165,15 +170,23 @@ def get_current_pattern():
 
 def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
     """Veritabanına kaydet veya CSV'ye (fallback)"""
-    timestamp = datetime.utcnow()
+    timestamp = datetime.now(timezone.utc)
     user_email = session.get('email', 'unknown')
     status = 'Approved' if approved else 'Rejected'
     
+    # Detaylı log ekle
+    print(f"🔍 save_review çağrıldı: USE_DATABASE={USE_DATABASE}, variant_sku={variant_sku}, status={status}", flush=True)
+    
     if USE_DATABASE:
         try:
+            print(f"🔍 Veritabanına kaydediliyor...", flush=True)
             db_session = SessionLocal()
+            print(f"🔍 Database session oluşturuldu", flush=True)
+            
             # Mevcut kaydı kontrol et
             existing = db_session.query(PatternReview).filter_by(variant_sku=str(variant_sku)).first()
+            print(f"🔍 Mevcut kayıt kontrolü: {'VAR' if existing else 'YOK'}", flush=True)
+            
             if existing:
                 # Güncelle
                 existing.product_sku = product_sku
@@ -182,6 +195,7 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
                 existing.status = status
                 existing.reviewed_by = user_email
                 existing.timestamp = timestamp
+                print(f"🔍 Mevcut kayıt güncelleniyor...", flush=True)
             else:
                 # Yeni kayıt
                 review = PatternReview(
@@ -195,13 +209,20 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
                     timestamp=timestamp
                 )
                 db_session.add(review)
+                print(f"🔍 Yeni kayıt eklendi: {variant_sku}", flush=True)
+            
             db_session.commit()
+            print(f"🔍 Commit başarılı", flush=True)
             db_session.close()
             reviewed_skus.add(str(variant_sku))
-            print(f"✅ Kayıt veritabanına kaydedildi: {variant_sku} - {status}")
+            print(f"✅ Kayıt veritabanına kaydedildi: {variant_sku} - {status}", flush=True)
         except Exception as e:
-            print(f"❌ Veritabanı kayıt hatası: {e}")
+            print(f"❌ Veritabanı kayıt hatası: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            print(f"❌ Hata detayları yukarıda", flush=True)
     else:
+        print(f"⚠️ USE_DATABASE=False, CSV'ye kaydediliyor (ama Render'da kalıcı değil!)", flush=True)
         # Fallback: CSV'ye kaydet
         filename = DATA_DIR / ("approved_patterns.csv" if approved else "rejected_patterns.csv")
         data = {
@@ -219,6 +240,7 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
         else:
             df.to_csv(filename, index=False, encoding='utf-8-sig')
         reviewed_skus.add(str(variant_sku))
+        print(f"⚠️ CSV'ye kaydedildi (kalıcı değil!): {variant_sku}", flush=True)
 
 # İlk yükleme
 load_patterns()
