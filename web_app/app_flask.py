@@ -97,18 +97,34 @@ def load_patterns():
         return None
 
 def load_reviewed_skus():
-    """Veritabanından tüm kontrol edilmiş SKU'ları yükle (global)"""
-    global reviewed_skus
+    """Veritabanından veya CSV'den kontrol edilmiş SKU'ları yükle (sadece mevcut pattern dosyasındaki SKU'lar)"""
+    global reviewed_skus, patterns_data
     reviewed = set()
     
+    # Önce patterns_data'yı yükle (hangi SKU'ların mevcut olduğunu bilmek için)
+    if patterns_data is None:
+        load_patterns()
+    
+    # Mevcut pattern dosyasındaki SKU'ları al
+    current_skus = set()
+    if patterns_data is not None and len(patterns_data) > 0:
+        current_skus = set(patterns_data['Variant SKU'].astype(str))
+    
+    print(f"🔍 DEBUG load_reviewed_skus: Mevcut pattern dosyasında {len(current_skus)} SKU var")
+    
     if USE_DATABASE:
+        # Veritabanından oku (web uygulaması veritabanı kullanıyorsa)
         try:
             db_session = SessionLocal()
             reviews = db_session.query(PatternReview).all()
-            reviewed = {str(review.variant_sku) for review in reviews}
+            # Sadece mevcut pattern dosyasındaki SKU'ları al
+            reviewed = {str(review.variant_sku) for review in reviews if str(review.variant_sku) in current_skus}
             db_session.close()
+            print(f"🔍 DEBUG load_reviewed_skus: Veritabanından {len(reviewed)} SKU bulundu (mevcut dosyada)")
         except Exception as e:
-            print(f"Veritabanı okuma hatası: {e}")
+            print(f"❌ Veritabanı okuma hatası: {e}")
+            import traceback
+            traceback.print_exc()
     else:
         # Fallback: CSV dosyalarından oku (local development)
         approved_file = DATA_DIR / "approved_patterns.csv"
@@ -116,20 +132,32 @@ def load_reviewed_skus():
         
         if approved_file.exists():
             try:
-                approved_df = pd.read_csv(approved_file)
+                approved_df = pd.read_csv(approved_file, encoding='utf-8-sig', on_bad_lines='skip')
                 if 'Variant SKU' in approved_df.columns:
-                    reviewed.update(approved_df['Variant SKU'].dropna().astype(str))
-            except:
-                pass
+                    approved_skus = set(approved_df['Variant SKU'].dropna().astype(str))
+                    # Sadece mevcut pattern dosyasındaki SKU'ları al
+                    reviewed.update(approved_skus & current_skus)
+                    print(f"🔍 DEBUG load_reviewed_skus: approved_patterns.csv'den {len(approved_skus & current_skus)} SKU bulundu")
+            except Exception as e:
+                print(f"❌ Approved CSV okuma hatası: {e}")
+                import traceback
+                traceback.print_exc()
+        
         if rejected_file.exists():
             try:
-                rejected_df = pd.read_csv(rejected_file)
+                rejected_df = pd.read_csv(rejected_file, encoding='utf-8-sig', on_bad_lines='skip')
                 if 'Variant SKU' in rejected_df.columns:
-                    reviewed.update(rejected_df['Variant SKU'].dropna().astype(str))
-            except:
-                pass
+                    rejected_skus = set(rejected_df['Variant SKU'].dropna().astype(str))
+                    # Sadece mevcut pattern dosyasındaki SKU'ları al
+                    reviewed.update(rejected_skus & current_skus)
+                    print(f"🔍 DEBUG load_reviewed_skus: rejected_patterns.csv'den {len(rejected_skus & current_skus)} SKU bulundu")
+            except Exception as e:
+                print(f"❌ Rejected CSV okuma hatası: {e}")
+                import traceback
+                traceback.print_exc()
     
     reviewed_skus = reviewed
+    print(f"✅ DEBUG load_reviewed_skus: Toplam {len(reviewed)} SKU kontrol edilmiş olarak işaretlendi (sadece mevcut dosyadan)")
     return reviewed
 
 def get_current_pattern():
