@@ -67,11 +67,16 @@ reviewed_skus = set()  # Global olarak kontrol edilen tüm SKU'lar
 def load_patterns():
     """Pattern dosyasını yükle - kontrol listesi dosyası (1000 ürün)"""
     global patterns_data
+    print(f"🔍 DEBUG load_patterns: PATTERNS_FILE = {PATTERNS_FILE}")
+    print(f"🔍 DEBUG load_patterns: Dosya var mı? {PATTERNS_FILE.exists()}")
+    
     if not PATTERNS_FILE.exists():
+        print(f"❌ DEBUG: Dosya bulunamadı: {PATTERNS_FILE}")
         return None
     
     try:
         df = pd.read_csv(PATTERNS_FILE, encoding='utf-8-sig', on_bad_lines='skip', low_memory=False)
+        print(f"🔍 DEBUG load_patterns: Dosya yüklendi, {len(df)} satır")
         expected_columns = ['Variant SKU', 'Product SKU', 'Original Patterns', 'AI Detected Pattern', 'Design Image URL']
         if len(df.columns) > len(expected_columns):
             if 'AI Detected Pattern' in df.columns:
@@ -83,9 +88,12 @@ def load_patterns():
             df.columns = expected_columns[:len(df.columns)]
         df = df.dropna(subset=['Variant SKU', 'Design Image URL'])
         patterns_data = df
+        print(f"✅ DEBUG load_patterns: {len(df)} ürün yüklendi")
         return df
     except Exception as e:
-        print(f"Hata: {e}")
+        print(f"❌ Hata: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def load_reviewed_skus():
@@ -132,7 +140,11 @@ def get_current_pattern():
         load_patterns()
         load_reviewed_skus()
     
+    print(f"🔍 DEBUG get_current_pattern: patterns_data boyutu = {len(patterns_data) if patterns_data is not None else 0}")
+    print(f"🔍 DEBUG get_current_pattern: reviewed_skus boyutu = {len(reviewed_skus)}")
+    
     if patterns_data is None or len(patterns_data) == 0:
+        print(f"❌ DEBUG get_current_pattern: patterns_data boş!")
         return None
     
     # Kullanıcı bazlı current_index (session'da saklanır)
@@ -145,7 +157,12 @@ def get_current_pattern():
         (patterns_data['AI Detected Pattern'].astype(str).str.strip().str.upper() != 'ERROR')
     ].copy()
     
+    print(f"🔍 DEBUG get_current_pattern: Filtreleme sonrası {len(df)} ürün kaldı")
+    
     if len(df) == 0:
+        print(f"❌ DEBUG get_current_pattern: Filtreleme sonrası hiç ürün kalmadı!")
+        print(f"🔍 DEBUG: İlk 5 reviewed SKU: {list(reviewed_skus)[:5]}")
+        print(f"🔍 DEBUG: İlk 5 pattern SKU: {list(patterns_data['Variant SKU'].astype(str))[:5]}")
         return None
     
     # Index'i sınırla
