@@ -58,15 +58,27 @@ if USE_DATABASE:
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-PATTERNS_FILE = DATA_DIR / "control_list_1000.csv"  # Kontrol listesi dosyası (1000 ürün)
+CONTROL_LIST_FILE = DATA_DIR / "control_list_1000.csv"  # Kontrol listesi dosyası (1000 ürün)
+FALLBACK_PATTERNS_FILE = DATA_DIR / "test_ai_pattern_results.csv"  # Fallback dosya
+# Önce control_list_1000.csv'yi dene, yoksa test_ai_pattern_results.csv'yi kullan
+PATTERNS_FILE = CONTROL_LIST_FILE if CONTROL_LIST_FILE.exists() else FALLBACK_PATTERNS_FILE
 
 # Global state
 patterns_data = None
 reviewed_skus = set()  # Global olarak kontrol edilen tüm SKU'lar
 
 def load_patterns():
-    """Pattern dosyasını yükle - kontrol listesi dosyası (1000 ürün)"""
-    global patterns_data
+    """Pattern dosyasını yükle - önce control_list_1000.csv, yoksa test_ai_pattern_results.csv"""
+    global patterns_data, PATTERNS_FILE
+    
+    # Önce control_list_1000.csv'yi kontrol et
+    if not CONTROL_LIST_FILE.exists():
+        print(f"⚠️ DEBUG load_patterns: control_list_1000.csv bulunamadı, test_ai_pattern_results.csv kullanılıyor")
+        PATTERNS_FILE = FALLBACK_PATTERNS_FILE
+    else:
+        PATTERNS_FILE = CONTROL_LIST_FILE
+        print(f"✅ DEBUG load_patterns: control_list_1000.csv bulundu, kullanılıyor")
+    
     print(f"🔍 DEBUG load_patterns: PATTERNS_FILE = {PATTERNS_FILE}")
     print(f"🔍 DEBUG load_patterns: Dosya var mı? {PATTERNS_FILE.exists()}")
     
