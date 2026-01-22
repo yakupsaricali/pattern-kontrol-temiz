@@ -27,3 +27,4 @@ data/*.csv
 !data/test_ai_pattern_results.csv
 !data/approved_patterns.csv
 !data/rejected_patterns.csv
+!data/control_list_1000.csv
