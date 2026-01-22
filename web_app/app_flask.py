@@ -1,13 +1,12 @@
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_file
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import secrets
 import os
 import io
 from sqlalchemy import create_engine, Column, String, DateTime, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Session için secret key
@@ -18,18 +17,24 @@ USE_DATABASE = False
 engine = None
 SessionLocal = None
 
+print(f"🔍 DATABASE_URL kontrolü: {'VAR' if DATABASE_URL else 'YOK'}", flush=True)
 if DATABASE_URL:
     try:
         # Render PostgreSQL URL'i genellikle postgres:// ile başlar, SQLAlchemy postgresql:// istiyor
         if DATABASE_URL.startswith('postgres://'):
             DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        print(f"🔍 Database URL formatı düzeltildi", flush=True)
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
         SessionLocal = sessionmaker(bind=engine)
         USE_DATABASE = True
-        print("✅ PostgreSQL veritabanı kullanılıyor")
+        print("✅ PostgreSQL veritabanı kullanılıyor", flush=True)
     except Exception as e:
-        print(f"❌ PostgreSQL bağlantı hatası: {e}")
+        print(f"❌ PostgreSQL bağlantı hatası: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         USE_DATABASE = False
+else:
+    print("⚠️ DATABASE_URL environment variable bulunamadı!", flush=True)
 
 # Veritabanı modelleri
 Base = declarative_base()
@@ -44,7 +49,20 @@ class PatternReview(Base):
     image_url = Column(Text)
     status = Column(String, nullable=False)  # 'Approved' or 'Rejected'
     reviewed_by = Column(String, nullable=False)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    timestamp = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+class PatternRecheck(Base):
+    __tablename__ = 'pattern_rechecks'
+    
+    id = Column(String, primary_key=True)  # Variant SKU
+    variant_sku = Column(String, nullable=False)
+    product_sku = Column(String)
+    ai_pattern = Column(Text)
+    image_url = Column(Text)
+    original_status = Column(String, nullable=False)  # İlk kontrol sonucu: 'Rejected'
+    recheck_status = Column(String, nullable=False)  # İkinci kontrol sonucu: 'Approved' or 'Rejected'
+    reviewed_by = Column(String, nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 # Tabloları oluştur
 if USE_DATABASE:
@@ -58,37 +76,20 @@ if USE_DATABASE:
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-CONTROL_LIST_FILE = DATA_DIR / "control_list_1000.csv"  # Kontrol listesi dosyası (1000 ürün)
-FALLBACK_PATTERNS_FILE = DATA_DIR / "test_ai_pattern_results.csv"  # Fallback dosya
-# Önce control_list_1000.csv'yi dene, yoksa test_ai_pattern_results.csv'yi kullan
-PATTERNS_FILE = CONTROL_LIST_FILE if CONTROL_LIST_FILE.exists() else FALLBACK_PATTERNS_FILE
+PATTERNS_FILE = DATA_DIR / "control_list_1000.csv"  # Kontrol listesi dosyası (1000 ürün)
 
 # Global state
 patterns_data = None
 reviewed_skus = set()  # Global olarak kontrol edilen tüm SKU'lar
 
 def load_patterns():
-    """Pattern dosyasını yükle - önce control_list_1000.csv, yoksa test_ai_pattern_results.csv"""
-    global patterns_data, PATTERNS_FILE
-    
-    # Önce control_list_1000.csv'yi kontrol et
-    if not CONTROL_LIST_FILE.exists():
-        print(f"⚠️ DEBUG load_patterns: control_list_1000.csv bulunamadı, test_ai_pattern_results.csv kullanılıyor")
-        PATTERNS_FILE = FALLBACK_PATTERNS_FILE
-    else:
-        PATTERNS_FILE = CONTROL_LIST_FILE
-        print(f"✅ DEBUG load_patterns: control_list_1000.csv bulundu, kullanılıyor")
-    
-    print(f"🔍 DEBUG load_patterns: PATTERNS_FILE = {PATTERNS_FILE}")
-    print(f"🔍 DEBUG load_patterns: Dosya var mı? {PATTERNS_FILE.exists()}")
-    
+    """Pattern dosyasını yükle - kontrol listesi dosyası (1000 ürün)"""
+    global patterns_data
     if not PATTERNS_FILE.exists():
-        print(f"❌ DEBUG: Dosya bulunamadı: {PATTERNS_FILE}")
         return None
     
     try:
         df = pd.read_csv(PATTERNS_FILE, encoding='utf-8-sig', on_bad_lines='skip', low_memory=False)
-        print(f"🔍 DEBUG load_patterns: Dosya yüklendi, {len(df)} satır")
         expected_columns = ['Variant SKU', 'Product SKU', 'Original Patterns', 'AI Detected Pattern', 'Design Image URL']
         if len(df.columns) > len(expected_columns):
             if 'AI Detected Pattern' in df.columns:
@@ -100,43 +101,30 @@ def load_patterns():
             df.columns = expected_columns[:len(df.columns)]
         df = df.dropna(subset=['Variant SKU', 'Design Image URL'])
         patterns_data = df
-        print(f"✅ DEBUG load_patterns: {len(df)} ürün yüklendi")
         return df
     except Exception as e:
-        print(f"❌ Hata: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Hata: {e}")
         return None
 
 def load_reviewed_skus():
-    """Veritabanından veya CSV'den kontrol edilmiş SKU'ları yükle (sadece mevcut pattern dosyasındaki SKU'lar)"""
-    global reviewed_skus, patterns_data
+    """Veritabanından tüm kontrol edilmiş SKU'ları yükle (global) - Sadece approved ve recheck edilmiş olanlar"""
+    global reviewed_skus
     reviewed = set()
     
-    # Önce patterns_data'yı yükle (hangi SKU'ların mevcut olduğunu bilmek için)
-    if patterns_data is None:
-        load_patterns()
-    
-    # Mevcut pattern dosyasındaki SKU'ları al
-    current_skus = set()
-    if patterns_data is not None and len(patterns_data) > 0:
-        current_skus = set(patterns_data['Variant SKU'].astype(str))
-    
-    print(f"🔍 DEBUG load_reviewed_skus: Mevcut pattern dosyasında {len(current_skus)} SKU var")
-    
     if USE_DATABASE:
-        # Veritabanından oku (web uygulaması veritabanı kullanıyorsa)
         try:
             db_session = SessionLocal()
-            reviews = db_session.query(PatternReview).all()
-            # Sadece mevcut pattern dosyasındaki SKU'ları al
-            reviewed = {str(review.variant_sku) for review in reviews if str(review.variant_sku) in current_skus}
+            # Sadece approved olanları ve recheck edilmiş olanları al
+            approved_reviews = db_session.query(PatternReview).filter_by(status='Approved').all()
+            reviewed.update({str(review.variant_sku) for review in approved_reviews})
+            
+            # Recheck edilmiş olanları da ekle (ikinci kontrol yapılmış)
+            rechecks = db_session.query(PatternRecheck).all()
+            reviewed.update({str(recheck.variant_sku) for recheck in rechecks})
+            
             db_session.close()
-            print(f"🔍 DEBUG load_reviewed_skus: Veritabanından {len(reviewed)} SKU bulundu (mevcut dosyada)")
         except Exception as e:
-            print(f"❌ Veritabanı okuma hatası: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Veritabanı okuma hatası: {e}")
     else:
         # Fallback: CSV dosyalarından oku (local development)
         approved_file = DATA_DIR / "approved_patterns.csv"
@@ -144,33 +132,37 @@ def load_reviewed_skus():
         
         if approved_file.exists():
             try:
-                approved_df = pd.read_csv(approved_file, encoding='utf-8-sig', on_bad_lines='skip')
+                approved_df = pd.read_csv(approved_file)
                 if 'Variant SKU' in approved_df.columns:
-                    approved_skus = set(approved_df['Variant SKU'].dropna().astype(str))
-                    # Sadece mevcut pattern dosyasındaki SKU'ları al
-                    reviewed.update(approved_skus & current_skus)
-                    print(f"🔍 DEBUG load_reviewed_skus: approved_patterns.csv'den {len(approved_skus & current_skus)} SKU bulundu")
-            except Exception as e:
-                print(f"❌ Approved CSV okuma hatası: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        if rejected_file.exists():
-            try:
-                rejected_df = pd.read_csv(rejected_file, encoding='utf-8-sig', on_bad_lines='skip')
-                if 'Variant SKU' in rejected_df.columns:
-                    rejected_skus = set(rejected_df['Variant SKU'].dropna().astype(str))
-                    # Sadece mevcut pattern dosyasındaki SKU'ları al
-                    reviewed.update(rejected_skus & current_skus)
-                    print(f"🔍 DEBUG load_reviewed_skus: rejected_patterns.csv'den {len(rejected_skus & current_skus)} SKU bulundu")
-            except Exception as e:
-                print(f"❌ Rejected CSV okuma hatası: {e}")
-                import traceback
-                traceback.print_exc()
+                    reviewed.update(approved_df['Variant SKU'].dropna().astype(str))
+            except:
+                pass
+        # Rejected dosyasını yükleme - çünkü onları tekrar kontrol edeceğiz
     
     reviewed_skus = reviewed
-    print(f"✅ DEBUG load_reviewed_skus: Toplam {len(reviewed)} SKU kontrol edilmiş olarak işaretlendi (sadece mevcut dosyadan)")
     return reviewed
+
+def load_rejected_skus():
+    """Veritabanından sadece rejected olan SKU'ları yükle (recheck için)"""
+    rejected = set()
+    
+    if USE_DATABASE:
+        try:
+            db_session = SessionLocal()
+            # Sadece rejected olanları al
+            rejected_reviews = db_session.query(PatternReview).filter_by(status='Rejected').all()
+            rejected = {str(review.variant_sku) for review in rejected_reviews}
+            
+            # Recheck edilmiş olanları çıkar (tekrar kontrol edilmiş)
+            rechecks = db_session.query(PatternRecheck).all()
+            rechecked_skus = {str(recheck.variant_sku) for recheck in rechecks}
+            rejected = rejected - rechecked_skus  # Recheck edilmiş olanları çıkar
+            
+            db_session.close()
+        except Exception as e:
+            print(f"Veritabanı okuma hatası: {e}")
+    
+    return rejected
 
 def get_current_pattern():
     """Kullanıcı bazlı pattern döndür (her kullanıcı farklı pattern görür)"""
@@ -180,11 +172,7 @@ def get_current_pattern():
         load_patterns()
         load_reviewed_skus()
     
-    print(f"🔍 DEBUG get_current_pattern: patterns_data boyutu = {len(patterns_data) if patterns_data is not None else 0}")
-    print(f"🔍 DEBUG get_current_pattern: reviewed_skus boyutu = {len(reviewed_skus)}")
-    
     if patterns_data is None or len(patterns_data) == 0:
-        print(f"❌ DEBUG get_current_pattern: patterns_data boş!")
         return None
     
     # Kullanıcı bazlı current_index (session'da saklanır)
@@ -197,12 +185,7 @@ def get_current_pattern():
         (patterns_data['AI Detected Pattern'].astype(str).str.strip().str.upper() != 'ERROR')
     ].copy()
     
-    print(f"🔍 DEBUG get_current_pattern: Filtreleme sonrası {len(df)} ürün kaldı")
-    
     if len(df) == 0:
-        print(f"❌ DEBUG get_current_pattern: Filtreleme sonrası hiç ürün kalmadı!")
-        print(f"🔍 DEBUG: İlk 5 reviewed SKU: {list(reviewed_skus)[:5]}")
-        print(f"🔍 DEBUG: İlk 5 pattern SKU: {list(patterns_data['Variant SKU'].astype(str))[:5]}")
         return None
     
     # Index'i sınırla
@@ -221,17 +204,70 @@ def get_current_pattern():
         'remaining': len(df)
     }
 
+def get_current_recheck_pattern():
+    """Rejected pattern'leri tekrar kontrol için döndür"""
+    global patterns_data
+    
+    if patterns_data is None:
+        load_patterns()
+    
+    if patterns_data is None or len(patterns_data) == 0:
+        return None
+    
+    # Rejected SKU'ları yükle (recheck edilmemiş olanlar)
+    rejected_skus = load_rejected_skus()
+    
+    if len(rejected_skus) == 0:
+        return None
+    
+    # Kullanıcı bazlı current_index (session'da saklanır)
+    user_email = session.get('email', 'unknown')
+    current_index = session.get(f'recheck_index_{user_email}', 0)
+    
+    # Sadece rejected olanları filtrele
+    df = patterns_data[
+        patterns_data['Variant SKU'].astype(str).isin(rejected_skus) &
+        (patterns_data['AI Detected Pattern'].astype(str).str.strip().str.upper() != 'ERROR')
+    ].copy()
+    
+    if len(df) == 0:
+        return None
+    
+    # Index'i sınırla
+    if current_index >= len(df):
+        current_index = 0
+        session[f'recheck_index_{user_email}'] = 0
+    
+    current_row = df.iloc[current_index]
+    return {
+        'variant_sku': current_row['Variant SKU'],
+        'product_sku': current_row['Product SKU'],
+        'ai_pattern': current_row['AI Detected Pattern'],
+        'image_url': current_row['Design Image URL'],
+        'total': len(patterns_data),
+        'rejected_count': len(rejected_skus),
+        'remaining': len(df)
+    }
+
 def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
     """Veritabanına kaydet veya CSV'ye (fallback)"""
-    timestamp = datetime.utcnow()
+    timestamp = datetime.now(timezone.utc)
     user_email = session.get('email', 'unknown')
     status = 'Approved' if approved else 'Rejected'
     
+    # Detaylı log ekle
+    print(f"🔍 save_review çağrıldı: USE_DATABASE={USE_DATABASE}, variant_sku={variant_sku}, status={status}", flush=True)
+    
     if USE_DATABASE:
         try:
+            print(f"🔍 Veritabanına kaydediliyor...", flush=True)
             db_session = SessionLocal()
+            print(f"🔍 Database session oluşturuldu", flush=True)
+            
             # Mevcut kaydı kontrol et
             existing = db_session.query(PatternReview).filter_by(variant_sku=str(variant_sku)).first()
+            print(f"🔍 Mevcut kayıt kontrolü: {'VAR' if existing else 'YOK'}", flush=True)
+            
             if existing:
                 # Güncelle
                 existing.product_sku = product_sku
@@ -240,6 +276,7 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
                 existing.status = status
                 existing.reviewed_by = user_email
                 existing.timestamp = timestamp
+                print(f"🔍 Mevcut kayıt güncelleniyor...", flush=True)
             else:
                 # Yeni kayıt
                 review = PatternReview(
@@ -253,13 +290,20 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
                     timestamp=timestamp
                 )
                 db_session.add(review)
+                print(f"🔍 Yeni kayıt eklendi: {variant_sku}", flush=True)
+            
             db_session.commit()
+            print(f"🔍 Commit başarılı", flush=True)
             db_session.close()
             reviewed_skus.add(str(variant_sku))
-            print(f"✅ Kayıt veritabanına kaydedildi: {variant_sku} - {status}")
+            print(f"✅ Kayıt veritabanına kaydedildi: {variant_sku} - {status}", flush=True)
         except Exception as e:
-            print(f"❌ Veritabanı kayıt hatası: {e}")
+            print(f"❌ Veritabanı kayıt hatası: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            print(f"❌ Hata detayları yukarıda", flush=True)
     else:
+        print(f"⚠️ USE_DATABASE=False, CSV'ye kaydediliyor (ama Render'da kalıcı değil!)", flush=True)
         # Fallback: CSV'ye kaydet
         filename = DATA_DIR / ("approved_patterns.csv" if approved else "rejected_patterns.csv")
         data = {
@@ -277,6 +321,66 @@ def save_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
         else:
             df.to_csv(filename, index=False, encoding='utf-8-sig')
         reviewed_skus.add(str(variant_sku))
+        print(f"⚠️ CSV'ye kaydedildi (kalıcı değil!): {variant_sku}", flush=True)
+
+def save_recheck_review(variant_sku, product_sku, ai_pattern, image_url, approved=True):
+    """İkinci kontrol (recheck) sonuçlarını kaydet"""
+    timestamp = datetime.now(timezone.utc)
+    user_email = session.get('email', 'unknown')
+    recheck_status = 'Approved' if approved else 'Rejected'
+    
+    print(f"🔍 save_recheck_review çağrıldı: variant_sku={variant_sku}, recheck_status={recheck_status}", flush=True)
+    
+    if USE_DATABASE:
+        try:
+            db_session = SessionLocal()
+            
+            # İlk kontrol sonucunu al
+            original_review = db_session.query(PatternReview).filter_by(variant_sku=str(variant_sku)).first()
+            if not original_review:
+                print(f"❌ İlk kontrol kaydı bulunamadı: {variant_sku}", flush=True)
+                db_session.close()
+                return
+            
+            original_status = original_review.status
+            
+            # Recheck kaydını kontrol et
+            existing_recheck = db_session.query(PatternRecheck).filter_by(variant_sku=str(variant_sku)).first()
+            
+            if existing_recheck:
+                # Güncelle
+                existing_recheck.product_sku = product_sku
+                existing_recheck.ai_pattern = ai_pattern
+                existing_recheck.image_url = image_url
+                existing_recheck.recheck_status = recheck_status
+                existing_recheck.reviewed_by = user_email
+                existing_recheck.timestamp = timestamp
+                print(f"🔍 Mevcut recheck kaydı güncelleniyor...", flush=True)
+            else:
+                # Yeni recheck kaydı
+                recheck = PatternRecheck(
+                    id=str(variant_sku),
+                    variant_sku=str(variant_sku),
+                    product_sku=product_sku,
+                    ai_pattern=ai_pattern,
+                    image_url=image_url,
+                    original_status=original_status,
+                    recheck_status=recheck_status,
+                    reviewed_by=user_email,
+                    timestamp=timestamp
+                )
+                db_session.add(recheck)
+                print(f"🔍 Yeni recheck kaydı eklendi: {variant_sku}", flush=True)
+            
+            db_session.commit()
+            db_session.close()
+            print(f"✅ Recheck kaydı veritabanına kaydedildi: {variant_sku} - {recheck_status}", flush=True)
+        except Exception as e:
+            print(f"❌ Recheck kayıt hatası: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"⚠️ USE_DATABASE=False, recheck CSV'ye kaydedilemiyor!", flush=True)
 
 # İlk yükleme
 load_patterns()
@@ -548,6 +652,7 @@ HTML_TEMPLATE = """
                 <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.3rem;">👤 {{ session.email }}</div>
                 <div>
                     <a href="/results" style="color: #667eea; text-decoration: none; font-size: 0.9rem; margin-right: 1rem;">📊 Sonuçlarım</a>
+                    <a href="/recheck" style="color: #ff9800; text-decoration: none; font-size: 0.9rem; margin-right: 1rem;">🔄 Recheck</a>
                     <a href="/logout" style="color: #f44336; text-decoration: none; font-size: 0.9rem;">Çıkış</a>
                 </div>
             </div>
@@ -660,11 +765,41 @@ HTML_TEMPLATE = """
 </html>
 """
 
+RECHECK_TEMPLATE = HTML_TEMPLATE.replace(
+    '<h2 style="margin: 0; font-size: 1.2rem; color: #333;">🎨 Pattern Kontrol Sistemi</h2>',
+    '<h2 style="margin: 0; font-size: 1.2rem; color: #333;">🔄 Recheck - Reddedilen Pattern\'ler</h2>'
+).replace(
+    'fetch(\'/api/current\')',
+    'fetch(\'/api/recheck/current\')'
+).replace(
+    'fetch(\'/api/approve\', {method: \'POST\'})',
+    'fetch(\'/api/recheck/approve\', {method: \'POST\'})'
+).replace(
+    'fetch(\'/api/reject\', {method: \'POST\'})',
+    'fetch(\'/api/recheck/reject\', {method: \'POST\'})'
+).replace(
+    'fetch(\'/api/next\', {method: \'POST\'})',
+    'fetch(\'/api/recheck/next\', {method: \'POST\'})'
+).replace(
+    'İlerleme: ${data.reviewed}/${data.total} tamamlandı | Kalan: ${data.remaining}',
+    'Recheck: ${data.rejected_count} reddedilen pattern | Kalan: ${data.remaining}'
+).replace(
+    '<a href="/results" style="color: #667eea; text-decoration: none; font-size: 0.9rem; margin-right: 1rem;">📊 Sonuçlarım</a>',
+    '<a href="/" style="color: #667eea; text-decoration: none; font-size: 0.9rem; margin-right: 1rem;">🏠 Ana Sayfa</a><a href="/results" style="color: #667eea; text-decoration: none; font-size: 0.9rem; margin-right: 1rem;">📊 Sonuçlarım</a>'
+)
+
 @app.route('/')
 def index():
     if 'email' not in session:
         return redirect(url_for('login'))
     return render_template_string(HTML_TEMPLATE, session=session)
+
+@app.route('/recheck')
+def recheck():
+    """Reddedilen pattern'leri tekrar kontrol sayfası"""
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    return render_template_string(RECHECK_TEMPLATE, session=session)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -983,6 +1118,62 @@ def api_next():
     session[f'current_index_{user_email}'] = current_index + 1
     return jsonify({'success': True})
 
+# Recheck API routes
+@app.route('/api/recheck/current')
+def api_recheck_current():
+    auth_error = require_auth()
+    if auth_error:
+        return auth_error
+    pattern = get_current_recheck_pattern()
+    if pattern is None:
+        return jsonify({'error': '🎉 Tüm reddedilen pattern\'ler tekrar kontrol edildi!'})
+    return jsonify(pattern)
+
+@app.route('/api/recheck/approve', methods=['POST'])
+def api_recheck_approve():
+    auth_error = require_auth()
+    if auth_error:
+        return auth_error
+    user_email = session.get('email', 'unknown')
+    pattern = get_current_recheck_pattern()
+    if pattern:
+        save_recheck_review(pattern['variant_sku'], pattern['product_sku'], 
+                           pattern['ai_pattern'], pattern['image_url'], approved=True)
+        # Kullanıcı bazlı index'i artır
+        current_index = session.get(f'recheck_index_{user_email}', 0)
+        session[f'recheck_index_{user_email}'] = current_index + 1
+        # reviewed_skus'a ekle (artık tekrar gösterilmesin)
+        reviewed_skus.add(str(pattern['variant_sku']))
+    return jsonify({'success': True})
+
+@app.route('/api/recheck/reject', methods=['POST'])
+def api_recheck_reject():
+    auth_error = require_auth()
+    if auth_error:
+        return auth_error
+    user_email = session.get('email', 'unknown')
+    pattern = get_current_recheck_pattern()
+    if pattern:
+        save_recheck_review(pattern['variant_sku'], pattern['product_sku'], 
+                           pattern['ai_pattern'], pattern['image_url'], approved=False)
+        # Kullanıcı bazlı index'i artır
+        current_index = session.get(f'recheck_index_{user_email}', 0)
+        session[f'recheck_index_{user_email}'] = current_index + 1
+        # reviewed_skus'a ekle (artık tekrar gösterilmesin)
+        reviewed_skus.add(str(pattern['variant_sku']))
+    return jsonify({'success': True})
+
+@app.route('/api/recheck/next', methods=['POST'])
+def api_recheck_next():
+    auth_error = require_auth()
+    if auth_error:
+        return auth_error
+    user_email = session.get('email', 'unknown')
+    # Kullanıcı bazlı index'i artır
+    current_index = session.get(f'recheck_index_{user_email}', 0)
+    session[f'recheck_index_{user_email}'] = current_index + 1
+    return jsonify({'success': True})
+
 @app.route('/admin/all')
 def admin_all():
     """Tüm kayıtları görüntüleme sayfası (tüm kullanıcılar)"""
@@ -992,12 +1183,14 @@ def admin_all():
     # Veritabanından tüm kayıtları çek
     approved_data = []
     rejected_data = []
+    recheck_data = []
     user_stats = {}
     
     if USE_DATABASE:
         try:
             db_session = SessionLocal()
             all_reviews = db_session.query(PatternReview).all()
+            all_rechecks = db_session.query(PatternRecheck).all()
             db_session.close()
             
             for review in all_reviews:
@@ -1018,11 +1211,30 @@ def admin_all():
                 # İstatistikler
                 email = review.reviewed_by
                 if email not in user_stats:
-                    user_stats[email] = {'approved': 0, 'rejected': 0}
+                    user_stats[email] = {'approved': 0, 'rejected': 0, 'recheck': 0}
                 if review.status == 'Approved':
                     user_stats[email]['approved'] += 1
                 else:
                     user_stats[email]['rejected'] += 1
+            
+            # Recheck kayıtlarını ekle
+            for recheck in all_rechecks:
+                item = {
+                    'Variant SKU': recheck.variant_sku,
+                    'Product SKU': recheck.product_sku,
+                    'AI Detected Pattern': recheck.ai_pattern,
+                    'Original Status': recheck.original_status,
+                    'Recheck Status': recheck.recheck_status,
+                    'Reviewed By': recheck.reviewed_by,
+                    'Timestamp': recheck.timestamp.isoformat() if recheck.timestamp else ''
+                }
+                recheck_data.append(item)
+                
+                # İstatistikler
+                email = recheck.reviewed_by
+                if email not in user_stats:
+                    user_stats[email] = {'approved': 0, 'rejected': 0, 'recheck': 0}
+                user_stats[email]['recheck'] = user_stats[email].get('recheck', 0) + 1
         except Exception as e:
             print(f"Veritabanı okuma hatası: {e}")
     else:
@@ -1200,19 +1412,24 @@ def admin_all():
                     <h3>{len(user_stats)}</h3>
                     <p>👥 Kullanıcı Sayısı</p>
                 </div>
+                <div class="stat-card" style="background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);">
+                    <h3>{len(recheck_data)}</h3>
+                    <p>🔄 Recheck Kayıtları</p>
+                </div>
             </div>
             
             <div class="user-stats">
                 <h2>👥 Kullanıcı İstatistikleri</h2>
     """
     
-    for email, stats in sorted(user_stats.items(), key=lambda x: x[1]['approved'] + x[1]['rejected'], reverse=True):
+    for email, stats in sorted(user_stats.items(), key=lambda x: x[1]['approved'] + x[1]['rejected'] + x[1].get('recheck', 0), reverse=True):
+        recheck_count = stats.get('recheck', 0)
         admin_html += f"""
                 <div class="user-item">
                     <div>
                         <strong>{email}</strong>
                         <div style="font-size: 0.9rem; color: #666; margin-top: 0.3rem;">
-                            ✅ {stats['approved']} Onay | ❌ {stats['rejected']} Red | 📝 {stats['approved'] + stats['rejected']} Toplam
+                            ✅ {stats['approved']} Onay | ❌ {stats['rejected']} Red | 🔄 {recheck_count} Recheck | 📝 {stats['approved'] + stats['rejected']} Toplam
                         </div>
                     </div>
                 </div>
@@ -1286,6 +1503,43 @@ def admin_all():
                     </tbody>
                 </table>
             </div>
+            
+            <div class="section">
+                <h2>🔄 Recheck Kayıtları (""" + str(len(recheck_data)) + """) 
+                    <a href="/download/recheck" class="btn download-btn">📥 CSV İndir</a>
+                </h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Variant SKU</th>
+                            <th>Product SKU</th>
+                            <th>AI Pattern</th>
+                            <th>İlk Durum</th>
+                            <th>Recheck Durum</th>
+                            <th>Reviewed By</th>
+                            <th>Tarih</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+    
+    for item in recheck_data:
+        admin_html += f"""
+                        <tr>
+                            <td>{item.get('Variant SKU', '')}</td>
+                            <td>{item.get('Product SKU', '')}</td>
+                            <td>{item.get('AI Detected Pattern', '')}</td>
+                            <td>{item.get('Original Status', '')}</td>
+                            <td>{item.get('Recheck Status', '')}</td>
+                            <td>{item.get('Reviewed By', '')}</td>
+                            <td>{item.get('Timestamp', '')[:19] if item.get('Timestamp') else ''}</td>
+                        </tr>
+        """
+    
+    admin_html += """
+                    </tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
@@ -1308,6 +1562,32 @@ def download_csv(file_type):
             elif file_type == 'rejected':
                 reviews = db_session.query(PatternReview).filter_by(status='Rejected').all()
                 filename = 'rejected_patterns.csv'
+            elif file_type == 'recheck':
+                rechecks = db_session.query(PatternRecheck).all()
+                filename = 'recheck_patterns.csv'
+                # Recheck için özel format
+                data = []
+                for recheck in rechecks:
+                    data.append({
+                        'Variant SKU': recheck.variant_sku,
+                        'Product SKU': recheck.product_sku,
+                        'AI Detected Pattern': recheck.ai_pattern,
+                        'Design Image URL': recheck.image_url,
+                        'Original Status': recheck.original_status,
+                        'Recheck Status': recheck.recheck_status,
+                        'Reviewed By': recheck.reviewed_by,
+                        'Timestamp': recheck.timestamp.isoformat() if recheck.timestamp else ''
+                    })
+                df = pd.DataFrame(data)
+                output = io.StringIO()
+                df.to_csv(output, index=False, encoding='utf-8-sig')
+                output.seek(0)
+                return send_file(
+                    io.BytesIO(output.getvalue().encode('utf-8-sig')),
+                    mimetype='text/csv',
+                    as_attachment=True,
+                    download_name=filename
+                )
             else:
                 return jsonify({'error': 'Invalid file type'}), 400
             
